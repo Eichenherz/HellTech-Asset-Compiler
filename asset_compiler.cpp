@@ -310,9 +310,9 @@ struct exported_texture
 
 struct material
 {
-	u16 baseColIdx;
-	u16 occRoughMetalIdx;
-	u16 normalMapIdx;
+	u16 baseColIdx = u16( -1 );
+	u16 occRoughMetalIdx = u16( -1 );
+	u16 normalMapIdx = u16( -1 );
 	XMFLOAT3 baseColFactor;
 	float metallicFactor;
 	float roughnessFactor;
@@ -334,14 +334,18 @@ struct imported_mesh
 
 struct node
 {
-	std::vector<u16> meshIndices;
-	std::vector<u16> materialIndices;
+	struct mesh_material
+	{
+		u16 mesh;
+		u16 material;
+	};
+	std::vector<mesh_material> assetIndices;
 	XMFLOAT4X4A transformation;
 	u16 parent;
 };
 
 // TODO: rethink samplers
-// TODO: more ?
+// TODO: assume no more than u16(-1)
 static void
 LoadGlbFile(
 	const std::span<u8>			glbData,
@@ -388,9 +392,6 @@ LoadGlbFile(
 		materials.push_back( {} );
 		
 		material& thisMaterial = materials[ thisMaterialIdx ];
-		thisMaterial.baseColIdx = -1;
-		thisMaterial.occRoughMetalIdx = -1;
-		thisMaterial.normalMapIdx = -1;
 
 		const cgltf_pbr_metallic_roughness& pbrMetallicRoughness = mtrl.pbr_metallic_roughness;
 		thisMaterial.baseColFactor = ( const XMFLOAT3& ) pbrMetallicRoughness.base_color_factor;
@@ -620,24 +621,52 @@ LoadGlbFile(
 	}
 
 
-	std::vector<node> nodeTransf( data->nodes_count );
+	std::vector<node*> hierarchy;
 
-	const cgltf_scene& scene = *data->scene;
-	for( u64 n = 0; n < data->nodes_count; ++n )
+	struct node_parent
 	{
-		const cgltf_node* node = data->nodes + n;
+		cgltf_node* n;
+		u16 parent;
+	};
+	std::vector<node_parent> dftStack;
+	const cgltf_scene& scene = *data->scene;
 
-		XMMATRIX t = CgltfNodeGetTransf( node );
+	// NOTE: Pre-order hierarchy traversal
+	// NOTE: start at root
+	// NOTE: push parent idx too 
+	dftStack.push_back( { scene.nodes[ 0 ], u16( -1 ) } );
 
-		for( const cgltf_node* parent = node->parent;
-			 parent;
-			 parent = parent->parent )
+	while( std::size( dftStack ) > 0 )
+	{
+		auto[ currentNode, currentParentIdx ] = dftStack.back();
+		dftStack.pop_back();
+
+		hierarchy.push_back( new node );
+		node& outNode = *hierarchy.back();
+
+		// NOTE: fill new node with data
+		outNode.parent = currentParentIdx;
+		XMMATRIX t = CgltfNodeGetTransf( currentNode );
+		XMStoreFloat4x4( &outNode.transformation, t );
+
+		const cgltf_mesh* nodeModel = currentNode->mesh;
+		for( u64 mi = 0; mi < nodeModel->primitives_count; ++mi )
 		{
-			t = XMMatrixMultiply( t, CgltfNodeGetTransf( parent ) );
-		}
-		//XMStoreFloat4x4( &nodeTransf[ n ], t );
-	}
+			const cgltf_primitive* currentMesh = &nodeModel->primitives[ mi ];
+			const cgltf_material* currentMaterial = currentMesh->material;
 
+			u16 meshIdx = meshPrimitivesLookup[ currentMesh ];
+			u16 materialIdx = materialLookup[ currentMaterial ];
+
+			outNode.assetIndices.push_back( { meshIdx,materialIdx } );
+		}
+		
+		u16 thisParentIdx = u16( std::size( hierarchy ) - 1 );
+		for( i64 cni = currentNode->children_count - 1; cni >= 0; --cni )
+		{
+			dftStack.push_back( { currentNode->children[ cni ], thisParentIdx } );
+		}
+	}
 
 	pJobSystem->Wait();
 
