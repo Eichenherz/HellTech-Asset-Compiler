@@ -16,8 +16,10 @@
 #include <string_view>		
 #include <assert.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <memory>
 #include <numeric>
+#include <algorithm>
 
 #include <functional>
 #include <thread>
@@ -65,31 +67,7 @@ enum pbr_type : u8
 	PBR_TYPE_METALLICROUGHNESS,
 	PBR_TYPE_COUNT
 };
-enum gltf_sampler_filter : u8
-{
-	GLTF_SAMPLER_FILTER_NEAREST = 0,
-	GLTF_SAMPLER_FILTER_LINEAR = 1,
-	GLTF_SAMPLER_FILTER_NEAREST_MIPMAP_NEAREST = 2,
-	GLTF_SAMPLER_FILTER_LINEAR_MIPMAP_NEAREST = 3,
-	GLTF_SAMPLER_FILTER_NEAREST_MIPMAP_LINEAR = 4,
-	GLTF_SAMPLER_FILTER_LINEAR_MIPMAP_LINEAR
-};
-enum gltf_sampler_address_mode : u8
-{
-	GLTF_SAMPLER_ADDRESS_MODE_REPEAT = 0,
-	GLTF_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE = 1,
-	GLTF_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT = 2
-};
 
-
-struct sampler_config
-{
-	gltf_sampler_filter			min;
-	gltf_sampler_filter			mag;
-	gltf_sampler_address_mode	addrU;
-	gltf_sampler_address_mode	addrV;
-	//gltf_sampler_address_mode	addrW;
-};
 
 // TODO: remove range and nameHash ?
 struct image_metadata
@@ -194,28 +172,6 @@ inline void PngDecodeImageFromMem( const png_decoder& dcd, u8* txBinOut, u64 txS
 }
 
 
-inline gltf_sampler_filter GetSamplerFilter( i32 code )
-{
-	switch( code )
-	{
-	case 9728: return GLTF_SAMPLER_FILTER_NEAREST;
-	case 9729: return GLTF_SAMPLER_FILTER_LINEAR;
-	case 9984: return GLTF_SAMPLER_FILTER_NEAREST_MIPMAP_NEAREST;
-	case 9985: return GLTF_SAMPLER_FILTER_LINEAR_MIPMAP_NEAREST;
-	case 9986: return GLTF_SAMPLER_FILTER_NEAREST_MIPMAP_LINEAR;
-	case 9987: return GLTF_SAMPLER_FILTER_LINEAR_MIPMAP_LINEAR;
-	}
-}
-inline gltf_sampler_address_mode GetSamplerAddrMode( i32 code )
-{
-	switch( code )
-	{
-	case 10497: return GLTF_SAMPLER_ADDRESS_MODE_REPEAT;
-	case 33071: return GLTF_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-	case 33648: return GLTF_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
-	}
-}
-
 // NOTE: will assume: pos,normal,tan are vec3 and uv is vec2
 struct _mesh
 {
@@ -310,26 +266,54 @@ struct exported_texture
 
 struct material
 {
-	u16 baseColIdx = u16( -1 );
-	u16 occRoughMetalIdx = u16( -1 );
-	u16 normalMapIdx = u16( -1 );
 	XMFLOAT3 baseColFactor;
 	float metallicFactor;
 	float roughnessFactor;
+	u16 baseColIdx = u16( -1 );
+	u16 occRoughMetalIdx = u16( -1 );
+	u16 normalMapIdx = u16( -1 );
+	u16 samplerIdx = u16( -1 );
 };
 
+constexpr u64 MAX_VTX = 128;
+constexpr u64 MAX_TRIS = 256;
+constexpr float CONE_WEIGHT = 0.8f;
+// NOTE: will repack later in to engine specific format
+/*
+* const u32* indexGroups = ( const u32* ) ( std::data( mletIdx ) + m.triangle_offset );
+		u64 indexGroupCount = ( m.triangle_count * 3 + 3 ) / 4;
+		for( u64 i = 0; i < indexGroupCount; ++i )
+		{
+			meshletData.push_back( indexGroups[ i ] );
+		}
+*/
+struct meshlet_data
+{
+	vec3	min;
+	vec3	max;
+
+	u32 vertexIndices[ MAX_VTX ];
+	u8 triangleIndices[ MAX_TRIS ];
+
+	u8 vertexCount;
+	u8 triangleCount;
+};
+
+// TODO: enforce u16 indices
 struct imported_mesh
 {
+	// NOTE: once reading from these, it's guaranteed that they all have the same count
 	std::vector<XMFLOAT3> positions;
 	std::vector<XMFLOAT3> normals;
 	std::vector<XMFLOAT3> tangents;
 	std::vector<XMFLOAT2> texCoords;
+
 	std::vector<u32> indexBuffer;
+
+	std::vector<meshlet_data> meshlets;
 
 	XMFLOAT3 aabbMin;
 	XMFLOAT3 aabbMax;
-
-	cgltf_component_type indexType;
 };
 
 struct node
@@ -344,18 +328,41 @@ struct node
 	u16 parent;
 };
 
-// TODO: rethink samplers
+inline static std::pair<XMFLOAT3, XMFLOAT3> ComputeAabbFromPoints( const std::vector<XMFLOAT3>& positions )
+{
+	using namespace DirectX;
+
+	constexpr float floatMin = std::numeric_limits<float>::min();
+	constexpr float floatMax = std::numeric_limits<float>::max();
+
+	XMFLOAT3 min = { floatMin, floatMin, floatMin };
+	XMFLOAT3 max = { floatMax, floatMax, floatMax };
+	for( const XMFLOAT3& v : positions )
+	{
+		if( v.x > max.x ) { max.x = v.x; }
+		if( v.x < min.x ) { min.x = v.x; }
+
+		if( v.y > max.y ) { max.y = v.y; }
+		if( v.y < min.y ) { min.y = v.y; }
+
+		if( v.z > max.z ) { max.z = v.z; }
+		if( v.z < min.z ) { min.z = v.z; }
+	}
+
+	return { min,max };
+}
+
+// TODO: use samplers ?
 // TODO: assume no more than u16(-1)
+// TODO: make tex compression independent of Gltf ?
 static void
 LoadGlbFile(
 	const std::span<u8>			glbData,
-	std::vector<float>&				meshAttrs,
-	std::vector<u32>&				indices,
-	std::vector<u8>&				texBin,
-	std::vector<image_metadata>&	imgDescs, 
-	std::vector<material_data>&		mtrlDescs,
-	std::vector<_mesh>&		meshDescs
-){
+	std::vector<exported_texture*>& texturesOut,
+	std::vector<material>& materialsOut,
+	std::vector<imported_mesh*>& importredMeshesOut,
+	std::vector<node*>& hierarchyOut
+) {
 	using namespace DirectX;
 	using texture_key = const cgltf_texture const*;
 	using material_key = const cgltf_material const*;
@@ -367,7 +374,8 @@ LoadGlbFile(
 	assert( !cgltf_parse( &options, std::data( glbData ), std::size( glbData ), &data ) );
 	assert( !cgltf_validate( data ) );
 	assert( data->scenes_count == 1 );
-	const u8* pBin = (const u8*) data->bin;
+	const u8* pBin = ( const u8* ) data->bin;
+
 
 	std::unordered_map<texture_key, u16> textureLookup;
 	std::vector<exported_texture*> textures;
@@ -390,13 +398,15 @@ LoadGlbFile(
 		u16 thisMaterialIdx = std::size( materials );
 		materialLookup.insert( { &mtrl, thisMaterialIdx } );
 		materials.push_back( {} );
-		
+
 		material& thisMaterial = materials[ thisMaterialIdx ];
 
 		const cgltf_pbr_metallic_roughness& pbrMetallicRoughness = mtrl.pbr_metallic_roughness;
 		thisMaterial.baseColFactor = ( const XMFLOAT3& ) pbrMetallicRoughness.base_color_factor;
 		thisMaterial.metallicFactor = pbrMetallicRoughness.metallic_factor;
 		thisMaterial.roughnessFactor = pbrMetallicRoughness.roughness_factor;
+
+		u16 thisMtrSamplerIdx = -1;
 
 		if( const cgltf_texture* pbrBaseCol = pbrMetallicRoughness.base_color_texture.texture )
 		{
@@ -417,7 +427,7 @@ LoadGlbFile(
 						raw_texture_extents raw = CgltfDecodeTexture( *pbrBaseCol, pBin, rawData );
 						outData.resize( GetBCTexByteCount( raw.width, raw.height, bc1BytesPerBlock ) );
 						CompressToBc1_SIMD( std::data( rawData ), raw.width, raw.height, std::data( outData ) );
-						
+
 						thisTexture.metadata = {
 							.width = raw.width,
 							.height = raw.height,
@@ -450,7 +460,7 @@ LoadGlbFile(
 						raw_texture_extents raw = CgltfDecodeTexture( *metalRoughMap, pBin, rawData );
 						outData.resize( GetBCTexByteCount( raw.width, raw.height, bc5BytesPerBlock ) );
 						CompressMetalRoughMapToBc5_SIMD( std::data( rawData ), raw.width, raw.height, std::data( outData ) );
-						
+
 						thisTexture.metadata = {
 							.width = raw.width,
 							.height = raw.height,
@@ -483,7 +493,7 @@ LoadGlbFile(
 						raw_texture_extents raw = CgltfDecodeTexture( *normalMap, pBin, rawData );
 						outData.resize( GetBCTexByteCount( raw.width, raw.height, bc5BytesPerBlock ) );
 						CompressMetalRoughMapToBc5_SIMD( std::data( rawData ), raw.width, raw.height, std::data( outData ) );
-						
+
 						thisTexture.metadata = {
 							.width = raw.width,
 							.height = raw.height,
@@ -496,13 +506,14 @@ LoadGlbFile(
 				);
 			}
 		}
+
+		thisMaterial.samplerIdx = thisMtrSamplerIdx;
 	}
 
 	for( u64 i = 0; i < std::size( jobs ); ++i )
 	{
-		pJobSystem->Execute( jobs[ i ] );
+		//pJobSystem->Execute( jobs[ i ] );
 	}
-	
 
 	for( u64 mi = 0; mi < data->meshes_count; ++mi )
 	{
@@ -510,6 +521,8 @@ LoadGlbFile(
 		for( u64 pi = 0; pi < thisMesh.primitives_count; ++pi )
 		{
 			const cgltf_primitive& prim = thisMesh.primitives[ pi ];
+
+			if( meshPrimitivesLookup.find( &prim ) != std::cend( meshPrimitivesLookup ) ) continue;
 
 			u16 thisMeshPrimitiveIdx = std::size( importredMeshes );
 			importredMeshes.push_back( new imported_mesh );
@@ -549,22 +562,9 @@ LoadGlbFile(
 					}
 					else
 					{
-						constexpr float floatMin = std::numeric_limits<float>::min();
-						constexpr float floatMax = std::numeric_limits<float>::max();
-
-						XMFLOAT3 min = { floatMin, floatMin, floatMin };
-						XMFLOAT3 max = { floatMax, floatMax, floatMax };
-						for( XMFLOAT3& v : m.positions )
-						{
-							if( v.x > max.x ) { max.x = v.x; }
-							if( v.x < min.x ) { min.x = v.x; }
-
-							if( v.y > max.y ) { max.y = v.y; }
-							if( v.y < min.y ) { min.y = v.y; }
-
-							if( v.z > max.z ) { max.z = v.z; }
-							if( v.z < min.z ) { min.z = v.z; }
-						}
+						auto [min, max] = ComputeAabbFromPoints( m.positions );
+						m.aabbMin = min;
+						m.aabbMax = max;
 					}
 				}
 
@@ -608,13 +608,15 @@ LoadGlbFile(
 			if( prim.indices )
 			{
 				m.indexBuffer.resize( prim.indices->count );
-				m.indexType = prim.indices->component_type;
+				// TODO: defer chuking to u16 if necessary
+				//assert( prim.indices->component_type == cgltf_component_type_r_16u );
+
 				const u8* idxSrc = pBin + prim.indices->buffer_view->offset;
 				u64 idxStride = prim.indices->stride;
 				for( u64 i = 0; i < prim.indices->count; ++i )
 				{
-					u64 idx = cgltf_component_read_index( idxSrc + idxStride * i, prim.indices->component_type );
-					m.indexBuffer[ i ] = u32( idx );
+					u32 idx = cgltf_component_read_index( idxSrc + idxStride * i, prim.indices->component_type );
+					m.indexBuffer[ i ] =  idx;
 				}
 			}
 		}
@@ -668,7 +670,12 @@ LoadGlbFile(
 		}
 	}
 
+	materialsOut = std::move( materials );
+	importredMeshesOut = std::move( importredMeshes );
+	hierarchyOut = std::move( hierarchy );
+
 	pJobSystem->Wait();
+	texturesOut = std::move( textures );
 
 	cgltf_free( data );
 }
@@ -716,99 +723,66 @@ void MeshoptOptimizeMesh( std::span<T> vtxSpan, std::span<u32> idxSpan )
 template u64 MeshoptReindexMesh( std::span<DirectX::XMFLOAT3> vtxSpan, std::span<u32> idxSpan );
 template void MeshoptOptimizeMesh( std::span<DirectX::XMFLOAT3> vtxSpan, std::span<u32> idxSpan );
 
-constexpr u64 MAX_VTX = 128;
-constexpr u64 MAX_TRIS = 256;
-constexpr float CONE_WEIGHT = 0.8f;
-// TODO: fix C++ constness thing
-// TODO: data offseting for more meshes
-static void MeshoptMakeMeshlets(
-	const std::span<vertex>	    vtxSpan,
-	const std::vector<u32>& lodIndices,
-	const std::vector<range>& lods,
-	std::vector<meshlet>& mletsDesc,
-	std::vector<u32>& mletsData,
-	std::vector<range>& outMeshletLods
+
+
+// NOTE: no need for pointers bc it's POD
+static std::vector<meshlet_data> MeshoptMakeMeshlets(
+	const std::vector<XMFLOAT3>& meshPositions,
+	const std::vector<u32>& lodIndices
 ){
 	using namespace DirectX;
 
-	std::vector<u32> meshletData;
+	std::vector<meshlet_data> meshletsOut;
 
 	std::vector<meshopt_Meshlet> meshlets;
 	std::vector<u32> mletVtx;
-	std::vector<u8> mletIdx;
+	std::vector<u8> mletTris;
 
-	for( range lodRange : lods )
+	
+	u64 maxMeshletCount = meshopt_buildMeshletsBound( std::size( lodIndices ), MAX_VTX, MAX_TRIS );
+	meshlets.resize( maxMeshletCount );
+	mletVtx.resize( maxMeshletCount * MAX_VTX );
+	mletTris.resize( maxMeshletCount * MAX_TRIS * 3 );
+
+	u64 meshletCount = meshopt_buildMeshlets( std::data( meshlets ), std::data( mletVtx ), std::data( mletTris ),
+											  std::data( lodIndices ), std::size( lodIndices ),
+											  &meshPositions[ 0 ].x, std::size( meshPositions ), sizeof( meshPositions[ 0 ] ),
+											  MAX_VTX, MAX_TRIS, CONE_WEIGHT );
+
+	const meshopt_Meshlet& last = meshlets[ meshletCount - 1 ];
+	meshlets.resize( meshletCount );
+	mletVtx.resize( last.vertex_offset + last.vertex_count );
+	mletTris.resize( last.triangle_offset + ( ( last.triangle_count * 3 + 3 ) & ~3 ) );
+	meshletsOut.reserve( meshletCount );
+
+	for( const meshopt_Meshlet& m : meshlets )
 	{
-		const std::span<u32> lodIdx = { const_cast< u32* >( std::data( lodIndices ) ) + lodRange.offset,lodRange.size };
+		assert( m.vertex_count <= MAX_VTX );
+		assert( m.triangle_count <= MAX_TRIS );
 
-		u64 maxMeshletCount = meshopt_buildMeshletsBound( std::size( lodIdx ), MAX_VTX, MAX_TRIS );
-		meshlets.resize( maxMeshletCount );
-		mletVtx.resize( maxMeshletCount * MAX_VTX );
-		mletIdx.resize( maxMeshletCount * MAX_TRIS * 3 );
+		meshletsOut.push_back( {} );
+		meshlet_data& thisMeshlet = meshletsOut[ std::size( meshletsOut ) - 1 ];
 
-		u64 meshletCount = meshopt_buildMeshlets( std::data( meshlets ), std::data( mletVtx ), std::data( mletIdx ),
-												  std::data( lodIdx ), std::size( lodIdx ),
-												  &vtxSpan[ 0 ].px, std::size( vtxSpan ), sizeof( vtxSpan[ 0 ] ),
-												  MAX_VTX, MAX_TRIS, CONE_WEIGHT );
+		thisMeshlet.vertexCount = m.vertex_count;
+		std::memcpy( thisMeshlet.vertexIndices, &mletVtx[ 0 ] + m.vertex_offset, m.vertex_count );
 
-		const meshopt_Meshlet& last = meshlets[ meshletCount - 1 ];
+		thisMeshlet.triangleCount = m.triangle_count;
+		std::memcpy( thisMeshlet.triangleIndices, &mletTris[ 0 ] + m.triangle_offset, m.triangle_count );
 
-		meshlets.resize( meshletCount );
-		mletVtx.resize( last.vertex_offset + last.vertex_count );
-		mletIdx.resize( last.triangle_offset + ( ( last.triangle_count * 3 + 3 ) & ~3 ) );
-		meshletData.reserve( std::size( meshletData ) + std::size( mletVtx ) + std::size( mletVtx ) );
-
-		u64 mletOffset = std::size( mletsDesc );
-		outMeshletLods.push_back( { mletOffset,meshletCount } );
-
-		for( const meshopt_Meshlet& m : meshlets )
+		// TODO: don't copy ?
+		std::vector<XMFLOAT3> mletPositions;
+		for( u64 vi = 0; vi < m.vertex_count; ++vi )
 		{
-			u64 dataOffset = std::size( meshletData );
-
-			for( u64 i = 0; i < m.vertex_count; ++i )
-			{
-				meshletData.push_back( mletVtx[ i + m.vertex_offset ] );
-			}
-
-			const u32* indexGroups = ( const u32* ) ( std::data( mletIdx ) + m.triangle_offset );
-			u64 indexGroupCount = ( m.triangle_count * 3 + 3 ) / 4;
-			for( u64 i = 0; i < indexGroupCount; ++i )
-			{
-				meshletData.push_back( indexGroups[ i ] );
-			}
-
-			meshopt_Bounds bounds = meshopt_computeMeshletBounds(
-				std::data( mletVtx ), std::data( mletIdx ), m.triangle_count,
-				&vtxSpan[ 0 ].px, std::size( vtxSpan ), sizeof( vtxSpan[ 0 ] ) );
-
-			// TODO: don't copy ?
-			XMFLOAT3 mletVertices[ MAX_VTX ] = {};
-			for( u64 vi = 0; vi < m.vertex_count; ++vi )
-			{
-				const vertex& v = vtxSpan[ mletVtx[ vi + m.vertex_offset ] ];
-				mletVertices[ vi ] = { v.px,v.py,v.pz };
-			}
-
-			BoundingBox aabb = {};
-			BoundingBox::CreateFromPoints( aabb, m.vertex_count, mletVertices, sizeof( mletVertices[ 0 ] ) );
-
-			meshlet data = {};
-			data.center = aabb.Center;
-			data.extent = aabb.Extents;
-			data.coneAxis = *( const XMFLOAT3* ) bounds.cone_axis;
-			data.coneApex = *( const XMFLOAT3* ) bounds.cone_apex;
-			data.coneX = bounds.cone_axis_s8[ 0 ];
-			data.coneY = bounds.cone_axis_s8[ 1 ];
-			data.coneZ = bounds.cone_axis_s8[ 2 ];
-			data.coneCutoff = bounds.cone_cutoff_s8;
-			data.vertexCount = m.vertex_count;
-			data.triangleCount = m.triangle_count;
-			data.dataOffset = dataOffset;
-			mletsDesc.push_back( data );
+			mletPositions.push_back( meshPositions[ mletVtx[ vi + m.vertex_offset ] ] );
 		}
 
-		mletsData.insert( std::end( mletsData ), std::begin( meshletData ), std::end( meshletData ) );
+		auto [min, max] = ComputeAabbFromPoints( mletPositions );
+
+		thisMeshlet.min = min;
+		thisMeshlet.max = max;
 	}
+
+	return meshletsOut;
 }
 
 constexpr u64 lodMaxCount = 1;
@@ -859,11 +833,9 @@ inline u64 MeshoptMakeMeshLods(
 	return totalIndexCount;
 }
 
-// TODO: world handedness
+
 // TODO: use u16 idx
 // TODO: quantize pos + uvs
-// TODO: revisit index offsets and stuff
-// TODO: expose mem ops ?
 static std::pair<range, range> AssembleAndOptimizeMesh(
 	const std::vector<float>& attrStreams,
 	const std::vector<u32>&   importedIndices,
@@ -871,6 +843,8 @@ static std::pair<range, range> AssembleAndOptimizeMesh(
 	std::vector<vertex>&      vertices,
 	std::vector<u32>&         indices
 ){
+	using namespace DirectX;
+
 	u64 vtxAttrCount = rawMesh.posStreamRange.size / 3;
 	u64 vtxOffset = std::size( vertices );
 	vertices.resize( vtxOffset + vtxAttrCount );
@@ -896,7 +870,7 @@ static std::pair<range, range> AssembleAndOptimizeMesh(
 		float ty = tanStream[ i * 3 + 1 ];
 		float tz = tanStream[ i * 3 + 2 ];
 
-		DirectX::XMFLOAT2 octaNormal = OctaNormalEncode( { nx,ny,nz } );
+		XMFLOAT2 octaNormal = OctaNormalEncode( { nx,ny,nz } );
 		float tanAngle = EncodeTanToAngle( { nx,ny,nz }, { tx,ty,tz } );
 
 		i8 snormNx = meshopt_quantizeSnorm( octaNormal.x, 8 );
@@ -939,6 +913,54 @@ static std::pair<range, range> AssembleAndOptimizeMesh(
 }
 
 
+inline static void MeshoptimizeMesh( imported_mesh& inMesh )
+{
+	if( std::size( inMesh.indexBuffer ) == 0 )
+	{
+		inMesh.indexBuffer.resize( std::size( inMesh.positions ) );
+		std::iota( std::begin( inMesh.indexBuffer ), std::end( inMesh.indexBuffer ), 0 );
+	}
+
+	meshopt_Stream streams[] = {
+		{std::data( inMesh.positions ), sizeof( inMesh.positions[ 0 ] ), sizeof( inMesh.positions[ 0 ] )},
+		{std::data( inMesh.normals ), sizeof( inMesh.normals[ 0 ] ), sizeof( inMesh.normals[ 0 ] )},
+		{std::data( inMesh.tangents ), sizeof( inMesh.tangents[ 0 ] ), sizeof( inMesh.tangents[ 0 ] )},
+		{std::data( inMesh.texCoords ), sizeof( inMesh.texCoords[ 0 ] ), sizeof( inMesh.texCoords[ 0 ] )},
+	};
+
+	u64 vertexCount = std::size( inMesh.positions );
+	u64 indexCount = std::size( inMesh.indexBuffer );
+	u32* pIndexBuffer = std::data( inMesh.indexBuffer );
+
+	assert( pIndexBuffer && indexCount );
+
+	std::vector<u32> remap( vertexCount );
+	u64 uniqueVtxCount = meshopt_generateVertexRemapMulti(
+		&remap[ 0 ], pIndexBuffer, indexCount, vertexCount, streams, std::size( streams ) );
+
+	meshopt_remapIndexBuffer( pIndexBuffer, pIndexBuffer, indexCount, std::data( remap ) );
+	for( meshopt_Stream& s : streams )
+	{
+		meshopt_remapVertexBuffer( ( void* ) s.data, s.data, uniqueVtxCount, s.size, std::data( remap ) );
+	}
+
+	meshopt_optimizeVertexCache( pIndexBuffer, pIndexBuffer, indexCount, uniqueVtxCount );
+	std::vector<u32> fetchRemap( uniqueVtxCount );
+	meshopt_optimizeVertexFetchRemap( std::data( fetchRemap ), pIndexBuffer, indexCount, uniqueVtxCount );
+
+	for( meshopt_Stream& s : streams )
+	{
+		meshopt_remapVertexBuffer( ( void* ) s.data, s.data, uniqueVtxCount, s.size, std::data( fetchRemap ) );
+	}
+
+	inMesh.positions.resize( uniqueVtxCount );
+	inMesh.normals.resize( uniqueVtxCount );
+	inMesh.tangents.resize( uniqueVtxCount );
+	inMesh.texCoords.resize( uniqueVtxCount );
+
+	inMesh.meshlets = MeshoptMakeMeshlets( inMesh.positions, inMesh.indexBuffer );
+}
+
 // TODO: more efficient copy
 // TODO: better binary file design ?
 void CompileGlbAssetToBinary( 
@@ -961,8 +983,21 @@ void CompileGlbAssetToBinary(
 	std::vector<meshlet>			mlets;
 	std::vector<u32>				mletsData;
 
-	LoadGlbFile( glbData, meshAttrs, rawIndices, texBin, imgDescs, mtrlDescs, rawMeshDescs );
 
+	std::vector<exported_texture*> textures;
+	std::vector<material> materials;
+	std::vector<imported_mesh*> importedMeshes;
+	std::vector<node*> hierarchy;
+
+	LoadGlbFile( glbData, textures, materials, importedMeshes, hierarchy );
+
+	for( u64 imi = 0; imi < std::size( importedMeshes ); ++imi )
+	{
+		MeshoptimizeMesh( *importedMeshes[ imi ] );
+	}
+	
+
+	
 	meshDescs.reserve( std::size( rawMeshDescs ) );
 	// TODO: expose lod loop ?
 	for( const _mesh& m : rawMeshDescs )
@@ -989,7 +1024,7 @@ void CompileGlbAssetToBinary(
 
 		const std::span<vertex> vtxSpan = { std::data( vertices ) + vtxRange.offset,vtxRange.size };
 		std::vector<range> meshletLods;
-		MeshoptMakeMeshlets( vtxSpan, indices, idxLods, mlets, mletsData, meshletLods );
+		//MeshoptMakeMeshlets( vtxSpan, indices, idxLods, mlets, mletsData, meshletLods );
 
 		assert( std::size( idxLods ) == std::size( meshletLods ) );
 
